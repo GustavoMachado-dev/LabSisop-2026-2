@@ -1,0 +1,372 @@
+#!/usr/bin/python3
+#
+# systeminfo - servidor REST que expoe informacoes do sistema em /status.
+#
+# Todas as informacoes sao lidas dinamicamente de /proc e /sys.
+# Somente a Python Standard Library e utilizada.
+
+import json
+import os
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+PORT = 8080
+
+
+# ----------------------------------------------------------------------
+# Helpers de leitura
+# ----------------------------------------------------------------------
+def read_file(path):
+    try:
+        with open(path, "r") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def read_lines(path):
+    return read_file(path).splitlines()
+
+
+# ----------------------------------------------------------------------
+# datetime: btime (/proc/stat) + uptime (/proc/uptime) = epoch atual
+# ----------------------------------------------------------------------
+def get_datetime():
+    btime = 0
+    for line in read_lines("/proc/stat"):
+        if line.startswith("btime "):
+            btime = int(line.split()[1])
+            break
+
+    now = btime + get_uptime()
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+
+
+# ----------------------------------------------------------------------
+# uptime: /proc/uptime
+# ----------------------------------------------------------------------
+def get_uptime():
+    campos = read_file("/proc/uptime").split()
+    if not campos:
+        return 0
+    return int(float(campos[0]))
+
+
+# ----------------------------------------------------------------------
+# cpu: /proc/cpuinfo (modelo e frequencia) e /proc/stat (uso)
+# ----------------------------------------------------------------------
+def _cpu_jiffies():
+    for line in read_lines("/proc/stat"):
+        if line.startswith("cpu "):
+            valores = [int(v) for v in line.split()[1:]]
+            total = sum(valores)
+            # 4o campo = idle, 5o campo = iowait
+            ocioso = valores[3] + (valores[4] if len(valores) > 4 else 0)
+            return total, ocioso
+    return 0, 0
+
+
+def get_cpu_usage():
+    total1, ocioso1 = _cpu_jiffies()
+    time.sleep(0.2)
+    total2, ocioso2 = _cpu_jiffies()
+
+    delta_total = total2 - total1
+    delta_ocioso = ocioso2 - ocioso1
+    if delta_total <= 0:
+        return 0.0
+    return round(100.0 * (delta_total - delta_ocioso) / delta_total, 1)
+
+
+def get_cpu_speed_mhz():
+    for line in read_lines("/proc/cpuinfo"):
+        if line.lower().startswith("cpu mhz"):
+            return round(float(line.split(":", 1)[1].strip()), 2)
+
+    # Fallback: cpufreq expoe a frequencia em kHz.
+    khz = read_file("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq").strip()
+    if khz.isdigit():
+        return round(int(khz) / 1000.0, 2)
+    return 0.0
+
+
+def get_cpu_info():
+    modelo = "unknown"
+    for line in read_lines("/proc/cpuinfo"):
+        if line.lower().startswith("model name"):
+            modelo = line.split(":", 1)[1].strip()
+            break
+
+    return {
+        "model": modelo,
+        "speed_mhz": get_cpu_speed_mhz(),
+        "usage_percent": get_cpu_usage(),
+    }
+
+
+# ----------------------------------------------------------------------
+# memory: /proc/meminfo
+# ----------------------------------------------------------------------
+def get_memory_info():
+    valores = {}
+    for line in read_lines("/proc/meminfo"):
+        partes = line.split(":", 1)
+        if len(partes) != 2:
+            continue
+        campo = partes[1].split()
+        if campo and campo[0].isdigit():
+            valores[partes[0]] = int(campo[0])  # em kB
+
+    total = valores.get("MemTotal", 0)
+    if "MemAvailable" in valores:
+        disponivel = valores["MemAvailable"]
+    else:
+        disponivel = (valores.get("MemFree", 0)
+                      + valores.get("Buffers", 0)
+                      + valores.get("Cached", 0))
+
+    return {
+        "total_mb": round(total / 1024.0, 1),
+        "used_mb": round((total - disponivel) / 1024.0, 1),
+    }
+
+
+# ----------------------------------------------------------------------
+# os_version: /proc/version
+# ----------------------------------------------------------------------
+def get_os_version():
+    versao = read_file("/proc/version").strip()
+    if versao:
+        return versao
+    return read_file("/proc/sys/kernel/osrelease").strip() or "unknown"
+
+
+# ----------------------------------------------------------------------
+# processes: /proc/<pid>/comm
+# ----------------------------------------------------------------------
+def get_process_list():
+    processos = []
+    for entrada in os.listdir("/proc"):
+        if not entrada.isdigit():
+            continue
+
+        nome = read_file("/proc/%s/comm" % entrada).strip()
+        if not nome:
+            # Fallback: o nome fica entre parenteses em /proc/<pid>/stat.
+            stat = read_file("/proc/%s/stat" % entrada)
+            if "(" in stat and ")" in stat:
+                nome = stat[stat.index("(") + 1:stat.rindex(")")]
+        if not nome:
+            continue
+
+        processos.append({"pid": int(entrada), "name": nome})
+
+    processos.sort(key=lambda p: p["pid"])
+    return processos
+
+
+# ----------------------------------------------------------------------
+# disks: /sys/block (tamanho em setores de 512 bytes)
+# ----------------------------------------------------------------------
+def get_disks():
+    discos = []
+    try:
+        dispositivos = sorted(os.listdir("/sys/block"))
+    except OSError:
+        return discos
+
+    for dev in dispositivos:
+        # Ignora dispositivos virtuais que nao sao armazenamento real.
+        if dev.startswith(("loop", "ram", "zram", "dm-", "md")):
+            continue
+
+        setores = read_file("/sys/block/%s/size" % dev).strip()
+        if not setores.isdigit():
+            continue
+
+        discos.append({
+            "device": "/dev/%s" % dev,
+            "size_mb": round(int(setores) * 512 / (1024.0 * 1024.0), 1),
+        })
+
+    return discos
+
+
+# ----------------------------------------------------------------------
+# usb_devices: /sys/bus/usb/devices
+# ----------------------------------------------------------------------
+def get_usb_devices():
+    dispositivos = []
+    base = "/sys/bus/usb/devices"
+    try:
+        entradas = sorted(os.listdir(base))
+    except OSError:
+        return dispositivos
+
+    for entrada in entradas:
+        caminho = os.path.join(base, entrada)
+
+        # Interfaces (ex.: "1-1:1.0") nao sao dispositivos; sao filhas deles.
+        if ":" in entrada:
+            continue
+        # Precisa ser um dispositivo USB de fato.
+        if not os.path.exists(os.path.join(caminho, "idVendor")):
+            continue
+
+        produto = read_file(os.path.join(caminho, "product")).strip()
+        fabricante = read_file(os.path.join(caminho, "manufacturer")).strip()
+
+        if produto and fabricante:
+            descricao = "%s %s" % (fabricante, produto)
+        elif produto or fabricante:
+            descricao = produto or fabricante
+        else:
+            descricao = "USB %s:%s" % (
+                read_file(os.path.join(caminho, "idVendor")).strip(),
+                read_file(os.path.join(caminho, "idProduct")).strip(),
+            )
+
+        dispositivos.append({"port": entrada, "description": descricao})
+
+    return dispositivos
+
+
+# ----------------------------------------------------------------------
+# network_adapters: /sys/class/net + /proc/net/fib_trie + /proc/net/route
+# ----------------------------------------------------------------------
+def _enderecos_locais():
+    """Endereços IPv4 locais listados em /proc/net/fib_trie."""
+    enderecos = []
+    anterior = None
+
+    for line in read_lines("/proc/net/fib_trie"):
+        stripped = line.strip()
+        if stripped.startswith("|--"):
+            anterior = stripped[3:].strip()
+        elif "/32 host LOCAL" in stripped and anterior:
+            if anterior not in enderecos:
+                enderecos.append(anterior)
+            anterior = None
+
+    return enderecos
+
+
+def _rotas_por_interface():
+    """Redes conectadas de cada interface, a partir de /proc/net/route."""
+    rotas = {}
+    linhas = read_lines("/proc/net/route")
+
+    for line in linhas[1:]:
+        campos = line.split()
+        if len(campos) < 8:
+            continue
+
+        iface = campos[0]
+        # Os valores vem em hexadecimal little-endian.
+        destino = int.from_bytes(bytes.fromhex(campos[1]), "little")
+        mascara = int.from_bytes(bytes.fromhex(campos[7]), "little")
+        if mascara == 0:
+            continue
+
+        rotas.setdefault(iface, []).append((destino, mascara))
+
+    return rotas
+
+
+def _ip_para_int(ip):
+    partes = ip.split(".")
+    if len(partes) != 4:
+        return None
+    valor = 0
+    for parte in partes:
+        if not parte.isdigit():
+            return None
+        valor = (valor << 8) | int(parte)
+    return valor
+
+
+def get_network_adapters():
+    adaptadores = []
+    try:
+        interfaces = sorted(os.listdir("/sys/class/net"))
+    except OSError:
+        return adaptadores
+
+    locais = _enderecos_locais()
+    rotas = _rotas_por_interface()
+
+    for iface in interfaces:
+        endereco = None
+
+        if iface == "lo":
+            endereco = "127.0.0.1" if "127.0.0.1" in locais else None
+        else:
+            for destino, mascara in rotas.get(iface, []):
+                for ip in locais:
+                    valor = _ip_para_int(ip)
+                    if valor is not None and (valor & mascara) == destino:
+                        endereco = ip
+                        break
+                if endereco:
+                    break
+
+        if endereco is None:
+            # Fallback IPv6: /proc/net/if_inet6.
+            for line in read_lines("/proc/net/if_inet6"):
+                campos = line.split()
+                if len(campos) == 6 and campos[5] == iface:
+                    bruto = campos[0]
+                    endereco = ":".join(bruto[i:i + 4] for i in range(0, 32, 4))
+                    break
+
+        adaptadores.append({"interface": iface, "ip_address": endereco})
+
+    return adaptadores
+
+
+# ----------------------------------------------------------------------
+# Servidor HTTP
+# ----------------------------------------------------------------------
+class StatusHandler(BaseHTTPRequestHandler):
+    server_version = "systeminfo/1.0"
+
+    def do_GET(self):
+        if self.path != "/status":
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Not Found")
+            return
+
+        response = {
+            "datetime": get_datetime(),
+            "uptime_seconds": get_uptime(),
+            "cpu": get_cpu_info(),
+            "memory": get_memory_info(),
+            "os_version": get_os_version(),
+            "processes": get_process_list(),
+            "disks": get_disks(),
+            "usb_devices": get_usb_devices(),
+            "network_adapters": get_network_adapters(),
+        }
+
+        data = json.dumps(response, indent=2).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, fmt, *args):
+        # Evita poluir o console serial a cada requisicao.
+        pass
+
+
+def run_server(port=PORT):
+    print("Servidor rodando em http://0.0.0.0:%d/status" % port)
+    server = HTTPServer(("0.0.0.0", port), StatusHandler)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    run_server()
