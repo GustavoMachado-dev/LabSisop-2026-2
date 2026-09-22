@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: buildroot-lab <buildroot-lab@localhost>
+Date: Mon, 22 Sep 2026 11:00:00 +0000
+Subject: [PATCH] Fix bootstrap link failure from GHS Multi generator header
+
+cmGlobalGhsMultiGenerator.h was included unconditionally on Linux,
+even during CMAKE_BOOTSTRAP builds where cmGlobalGhsMultiGenerator.cxx
+is never compiled (the bootstrap script's hardcoded source list only
+adds GHS/MinGW sources for the MinGW case). The header's inline
+NewFactory() method still references the out-of-line constructor,
+so any host toolchain that doesn't eliminate the unused inline
+function emits an unresolved weak symbol, causing:
+
+  undefined reference to `cmGlobalGhsMultiGenerator::cmGlobalGhsMultiGenerator(cmake*)'
+
+during the final `cmake` bootstrap link. Guard the include with
+!defined(CMAKE_BOOTSTRAP) to match the guard already used around the
+generator's registration in AddDefaultGenerators().
+
+Signed-off-by: buildroot-lab <buildroot-lab@localhost>
+---
+ Source/cmake.cxx | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/Source/cmake.cxx b/Source/cmake.cxx
+index 0000000..0000000 100644
+--- a/Source/cmake.cxx
++++ b/Source/cmake.cxx
+@@ -92,7 +92,7 @@
+ #  include "cmExtraEclipseCDT4Generator.h"
+ #endif
+
+-#if defined(__linux__) || defined(_WIN32)
++#if !defined(CMAKE_BOOTSTRAP) && (defined(__linux__) || defined(_WIN32))
+ #  include "cmGlobalGhsMultiGenerator.h"
+ #endif
+
+--
+2.43.0

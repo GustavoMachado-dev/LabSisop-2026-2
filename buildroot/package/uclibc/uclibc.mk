@@ -374,7 +374,8 @@ UCLIBC_MAKE_FLAGS = \
 	ARCH="$(UCLIBC_TARGET_ARCH)" \
 	CROSS_COMPILE="$(TARGET_CROSS)" \
 	UCLIBC_EXTRA_CFLAGS="$(UCLIBC_EXTRA_CFLAGS)" \
-	HOSTCC="$(HOSTCC)"
+	HOSTCC="$(HOSTCC)" \
+	BUILD_CFLAGS="-Os -std=gnu17 -Wno-error=implicit-function-declaration -Wno-error=implicit-int"
 
 define UCLIBC_KCONFIG_FIXUP_CMDS
 	$(call KCONFIG_SET_OPT,CROSS_COMPILER_PREFIX,"$(TARGET_CROSS)")
@@ -415,7 +416,9 @@ define UCLIBC_BUILD_CMDS
 	$(MAKE) -C $(@D) $(UCLIBC_MAKE_FLAGS)
 	$(MAKE) -C $(@D)/utils \
 		PREFIX=$(HOST_DIR) \
-		HOSTCC="$(HOSTCC)" hostutils
+		HOSTCC="$(HOSTCC)" \
+		BUILD_CFLAGS="-Os -std=gnu17 -Wno-error=implicit-function-declaration -Wno-error=implicit-int" \
+		hostutils
 endef
 
 ifeq ($(BR2_UCLIBC_INSTALL_UTILS),y)
