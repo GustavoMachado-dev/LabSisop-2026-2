@@ -3,6 +3,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <string.h>
 
 #define SYSCALL_PROCESSINFO	385
 
@@ -31,7 +33,7 @@ int main(int argc, char** argv){
 		printf("%s\n", buf);
 	}
 	else {
-		printf("System call 'listProcessInfo' did not execute as expected error %d\n", ret);
+		printf("System call 'listProcessInfo' did not execute as expected error %ld (errno %d: %s)\n", ret, errno, strerror(errno));
 	}
           
 	return 0;
